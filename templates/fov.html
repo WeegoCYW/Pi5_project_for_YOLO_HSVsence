@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"> <!-- 確保響應式設計 -->
+    <title>實時距離偵測與 FOV 計算</title>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <style>
+        /* CSS Reset and Global Styles */
+        * { box-sizing: border-box; }
+
+        body { 
+            font-family: 'Inter', Arial, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background-color: #f0f4f8; 
+            display: flex;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container { 
+            display: flex; 
+            width: 95%; 
+            max-width: 1400px; 
+            min-height: 80vh;
+            background-color: #fff; 
+            box-shadow: 0 8px 24px rgba(0,0,0,0.15); 
+            border-radius: 16px; 
+            overflow: hidden; 
+            transition: width 0.3s;
+        }
+
+        /* 響應式佈局：小螢幕時改為垂直堆疊 */
+        @media (max-width: 1024px) {
+            .container { flex-direction: column; width: 98%; }
+            .video-feed { width: 100% !important; height: auto !important; max-height: 80vh; border-radius: 16px 16px 0 0; }
+            .controls { padding: 20px; }
+        }
+
+        .video-feed { 
+            position: relative; 
+            width: 70%; 
+            max-width: 960px; 
+            height: auto;
+            /* 使用 padding-bottom Hack 來維持 4:3 比例 (640/480) */
+            padding-bottom: 52.5%; 
+            flex-shrink: 0; 
+            background-color: #000;
+        }
+        
+        .video-feed img {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain; 
+        }
+
+        .controls { 
+            flex-grow: 1; 
+            padding: 30px; 
+            min-width: 300px; 
+            display: flex; /* 使用 flex 排版來管理兩個計算區塊 */
+            flex-direction: column;
+            gap: 20px; /* 區塊間距 */
+        }
+        .section-box {
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 12px;
+            background-color: #f9f9f9;
+        }
+        
+        h1 { color: #004085; text-align: center; margin-bottom: 25px; font-weight: 700; }
+        h2 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; margin-bottom: 20px; font-size: 1.5em; }
+        h3 { margin-top: 0; color: #555; font-size: 1.2em; }
+        
+        /* 拖曳標記的樣式 */
+        .marker {
+            position: absolute;
+            width: 10px;
+            height: 60px; 
+            top: 50%; 
+            transform: translateY(-50%) translateX(-5px); /* 向左偏移 5px，讓標記中心線對齊 left 座標 */
+            cursor: ew-resize;
+            z-index: 10;
+            opacity: 0.8;
+            transition: opacity 0.2s, box-shadow 0.2s;
+            border-radius: 3px;
+        }
+        .marker:hover { opacity: 1.0; box-shadow: 0 0 10px rgba(255, 255, 255, 0.5); }
+        #marker-start { background-color: rgba(0, 200, 0, 0.7); left: 15%; } 
+        #marker-end { background-color: rgba(0, 0, 200, 0.7); left: 75%; }   
+
+        .result { 
+            margin-top: 15px; 
+            padding: 20px; 
+            border: 4px solid #28a745; 
+            background-color: #e9fff0; 
+            border-radius: 12px;
+        }
+        .highlight { 
+            font-size: 2.2em; 
+            color: #dc3545; 
+            font-weight: 900; 
+            display: block; 
+            margin-top: 5px;
+            word-break: break-all;
+        }
+        .highlight-blue {
+            font-size: 2.2em; 
+            color: #007bff; 
+            font-weight: 900; 
+            display: block; 
+            margin-top: 5px;
+            word-break: break-all;
+        }
+        label { display: block; margin-top: 20px; font-weight: bold; color: #333; font-size: 1.1em; }
+        input[type="number"] { 
+            width: 95%; 
+            padding: 12px; 
+            margin-top: 8px; 
+            border: 1px solid #ddd; 
+            border-radius: 6px; 
+            font-size: 1.2em; 
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.05);
+        }
+        p { color: #666; font-size: 1.0em; margin-bottom: 10px;}
+    </style>
+</head>
+<body>
+    <h1>🔭 實時距離偵測與視野計算</h1>
+    
+    <div class="container">
+        <!-- 影像串流區塊 -->
+        <div class="video-feed" id="video-container">
+            <!-- 視訊畫面 -->
+            <img id="video-stream" src="{{ url_for('video_feed') }}" alt="即時視訊串流">
+            
+            <!-- 拖曳標記 -->
+            <div class="marker" id="marker-start" data-side="start"></div>
+            <div class="marker" id="marker-end" data-side="end"></div>
+        </div>
+
+        <!-- 計算控制區塊 -->
+        <div class="controls">
+            
+            <div class="section-box">
+                <h2>1. 直尺校準與相機距離 D</h2>
+                
+                <label for="actual_H">步驟一：設定實際測量長度 H (mm)</label>
+                <p>請將直尺**平行**放置並對齊紅線。填寫**綠色標記與藍色標記間的實際長度**。</p>
+                <input type="number" id="actual_H" value="100" min="1" required>
+
+                <label style="margin-top: 30px;">步驟二：拖曳標記</label>
+                <p>拖曳標記線，使其對齊您直尺上 H 長度的兩端點。</p>
+                
+                <div class="result">
+                    <h3>即時計算結果</h3>
+                    <p>測量實際長度 H：<span id="display-H" class="highlight">100 mm</span></p>
+                    <p>畫面像素長度 h：<span id="display-h" class="highlight">--- px</span></p>
+                    
+                    <!-- 新增像素尺度顯示 -->
+                    <p style="font-size: 1.1em; font-weight: bold; margin-top: 15px;">在當前距離下，像素尺度為：</p>
+                    <div class="highlight" id="display-pixel-scale" style="font-size: 1.8em; color: #333;">--- mm/px</div>
+
+                    <p>計算出的畫面全寬 W：<span id="display-W">---</span></p>
+                    <p style="font-size: 1.3em; font-weight: bold; margin-top: 15px;">攝影機到直尺的距離 D：</p>
+                    <div class="highlight" id="display-D">---</div>
+                </div>
+
+                <p style="margin-top: 30px; font-size: 0.9em; color: #999; text-align: right;">
+                    **相機參數：** Focal/Sensor Ratio (f/d) = **{{ "%.4f"|format(ratio) }}**
+                </p>
+            </div>
+            
+            <!-- 窗口物體距離計算區塊 (與上次相同) -->
+            <div class="section-box">
+                <h2>2. 窗口物體距離計算</h2>
+                <p>用於計算透過特定窗口看到箱內物體的**最小**距離 $X$。</p>
+                
+                <label for="window_diameter_Hw">窗口實際直徑 $H_W$ (mm)</label>
+                <input type="number" id="window_diameter_Hw" value="150" min="1" required>
+                
+                <label for="camera_to_window_Dw">攝影機到窗口距離 $D_W$ (mm)</label>
+                <input type="number" id="camera_to_window_Dw" value="128" min="1" required>
+                
+                <label for="box_object_Hb">箱內物體實際長度 $H_B$ (mm)</label>
+                <input type="number" id="box_object_Hb" value="245" min="1" required>
+                
+                <div class="result" style="border-color: #007bff; background-color: #e6f7ff; margin-top: 25px;">
+                    <h3>計算結果</h3>
+                    <p style="font-size: 1.3em; font-weight: bold; margin-top: 15px;">物體與窗口的最小距離 $X$：</p>
+                    <div class="highlight-blue" id="display-X">---</div>
+                    <p style="font-size: 0.9em; color: #666; margin-top: 10px;">
+                        *若 $H_B$ 大於 $H_W$ 且 $X$ 為正值，表示此距離才能看到完整物體。
+                    </p>
+                </div>
+            </div>
+
+        </div>
+    </div>
+    
+    <script>
+        // Python OpenCV 實際解析度
+        const PYTHON_CAMERA_WIDTH = 640; 
+        
+        // 拖曳相關變數
+        let start_x_display = 0; 
+        let end_x_display = 0;   
+        let actual_H = 100; // 預設 100mm (步驟一：直尺實際長度 H)
+        
+        // 窗口計算相關變數 (步驟二)
+        let Hw = 150; // 窗口實際直徑
+        let Dw = 128; // 攝影機到窗口距離
+        let Hb = 245; // 箱內物體實際長度
+
+
+        // --- 拖曳事件處理 (與上次相同) ---
+        $(function() {
+            const videoContainer = document.getElementById('video-container');
+            const markers = document.querySelectorAll('.marker');
+
+            // 輔助函數：取得當前影像容器的寬度
+            function getCurrentVideoWidth() {
+                return videoContainer.offsetWidth;
+            }
+            
+            // 輔助函數：初始化或更新標記位置
+            function updateMarkerPositions() {
+                const currentWidth = getCurrentVideoWidth();
+                
+                start_x_display = currentWidth * 0.15;
+                end_x_display = currentWidth * 0.75;
+                
+                document.getElementById('marker-start').style.left = start_x_display + 'px';
+                document.getElementById('marker-end').style.left = end_x_display + 'px';
+                
+                // 執行初始計算 (步驟一)
+                sendCalculationData();
+            }
+
+            // 在視窗調整大小時重新計算位置
+            window.addEventListener('resize', updateMarkerPositions);
+            
+            // 初始化
+            updateMarkerPositions();
+            
+            markers.forEach(marker => {
+                let isDragging = false;
+                let startClientX = 0;
+                let startLeft = 0;
+                let markerId = marker.id;
+
+                marker.addEventListener('mousedown', (e) => {
+                    isDragging = true;
+                    startClientX = e.clientX;
+                    startLeft = parseFloat(getComputedStyle(marker).left);
+                    e.preventDefault(); 
+                });
+
+                document.addEventListener('mousemove', (e) => {
+                    if (!isDragging) return;
+                    
+                    const currentWidth = getCurrentVideoWidth();
+                    let deltaX = e.clientX - startClientX;
+                    let newLeft = startLeft + deltaX;
+
+                    // 限制範圍為 0 到 currentWidth (讓標記中心線可以完全貼齊邊緣)
+                    newLeft = Math.max(0, Math.min(currentWidth, newLeft)); 
+                    marker.style.left = newLeft + 'px';
+                    
+                    if (markerId === 'marker-start') {
+                        start_x_display = newLeft;
+                    } else {
+                        end_x_display = newLeft;
+                    }
+                    
+                    sendCalculationData();
+                });
+
+                document.addEventListener('mouseup', () => {
+                    if (isDragging) {
+                        isDragging = false;
+                        sendCalculationData(); 
+                    }
+                });
+                
+                // 觸控事件處理 (與上次相同)
+                marker.addEventListener('touchstart', (e) => {
+                    if (e.touches.length === 1) {
+                        isDragging = true;
+                        startClientX = e.touches[0].clientX;
+                        startLeft = parseFloat(getComputedStyle(marker).left);
+                        e.preventDefault(); 
+                    }
+                });
+
+                document.addEventListener('touchmove', (e) => {
+                    if (!isDragging || e.touches.length !== 1) return;
+                    
+                    const currentWidth = getCurrentVideoWidth();
+                    let deltaX = e.touches[0].clientX - startClientX;
+                    let newLeft = startLeft + deltaX;
+
+                    newLeft = Math.max(0, Math.min(currentWidth, newLeft)); 
+                    marker.style.left = newLeft + 'px';
+                    
+                    if (markerId === 'marker-start') {
+                        start_x_display = newLeft;
+                    } else {
+                        end_x_display = newLeft;
+                    }
+                    
+                    sendCalculationData();
+                });
+
+                document.addEventListener('touchend', () => {
+                    if (isDragging) {
+                        isDragging = false;
+                        sendCalculationData();
+                    }
+                });
+            });
+            
+            // 步驟一：直尺 H 輸入框事件
+            $('#actual_H').on('input', function() {
+                actual_H = parseFloat($(this).val());
+                if (isNaN(actual_H) || actual_H <= 0) {
+                     $('#display-H').text('無效值');
+                     $('#display-pixel-scale').text('---'); // 清除像素尺度
+                     return;
+                }
+                $('#display-H').text(actual_H + ' mm');
+                sendCalculationData();
+            });
+
+            // 步驟二：窗口計算輸入框事件
+            $('#window_diameter_Hw, #camera_to_window_Dw, #box_object_Hb').on('input', function() {
+                Hw = parseFloat($('#window_diameter_Hw').val());
+                Dw = parseFloat($('#camera_to_window_Dw').val());
+                Hb = parseFloat($('#box_object_Hb').val());
+                calculateWindowDistance(); 
+            });
+            
+            // 初始執行一次窗口計算
+            calculateWindowDistance();
+            
+            // 初始顯示 H
+            $('#display-H').text(actual_H + ' mm');
+        });
+
+        // --- 窗口距離計算函數 ---
+        function calculateWindowDistance() {
+            // ... (與上次相同，不需要修改)
+            if (isNaN(Hw) || Hw <= 0 || isNaN(Dw) || Dw <= 0 || isNaN(Hb) || Hb <= 0) {
+                 $('#display-X').text('---');
+                 return;
+            }
+            
+            let X = Dw * (Hb / Hw - 1);
+            
+            if (X < 0) {
+                $('#display-X').html(`0 mm<br><span style="font-size: 0.5em; color: #28a745;">(物體比窗口小，已完整看到)</span>`);
+            } else {
+                $('#display-X').text(X.toFixed(2) + ' mm');
+            }
+        }
+
+
+        // --- AJAX 傳輸和相機距離計算函數 (步驟一) ---
+        function sendCalculationData() {
+            if (isNaN(actual_H) || actual_H <= 0) {
+                return;
+            }
+            
+            const currentVideoWidth = document.getElementById('video-container').offsetWidth;
+            if (currentVideoWidth === 0) return; 
+
+            // 1. 計算縮放因子和 Python 基準座標
+            const SCALE_FACTOR = currentVideoWidth / PYTHON_CAMERA_WIDTH; 
+            const start_x_python = start_x_display / SCALE_FACTOR;
+            const end_x_python = end_x_display / SCALE_FACTOR;
+            const pixel_h = Math.abs(start_x_python - end_x_python);
+            
+            // 檢查像素長度是否為零，避免除以零
+            if (pixel_h < 1) {
+                $('#display-h').text('---');
+                $('#display-pixel-scale').text('---');
+                return;
+            }
+
+            // 2. 計算像素尺度 (H / h)
+            const pixel_scale = actual_H / pixel_h;
+            
+            // 3. 更新前端顯示
+            $('#display-h').text(Math.round(pixel_h) + ' px');
+            $('#display-pixel-scale').text(pixel_scale.toFixed(3) + ' mm/px'); // 顯示 1px = X mm
+
+            // 4. 傳送數據到後端計算 D
+            const dataToSend = {
+                start_x: start_x_python,
+                end_x: end_x_python,
+                actual_H: actual_H
+            };
+            
+            $.ajax({
+                url: '/calculate',
+                type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify(dataToSend),
+                success: function(response) {
+                    if (response.success) {
+                        $('#display-W').text(response.W + ' mm');
+                        $('#display-D').text(response.distance_D + ' mm');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    console.error("計算失敗:", error);
+                    const errorMsg = xhr.responseJSON ? xhr.responseJSON.error : '伺服器錯誤';
+                    $('#display-D').text(errorMsg);
+                }
+            });
+        }
+        
+    </script>
+</body>
+</html>
