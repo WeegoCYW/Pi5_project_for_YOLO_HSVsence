@@ -5,10 +5,28 @@ import threading
 import time
 import logging
 from ultralytics import YOLO
+import paho.mqtt.client as mqtt
+import json
 
 # ====================================================================
 # ⭐ 全域設定與資源初始化
 # ====================================================================
+
+## MQTT 範例
+MQTT_BROKER = "192.168.99.168"   # MQTT broker IP
+MQTT_PORT = 1883
+MQTT_USERNAME = ""              # 若沒有帳密可留空
+MQTT_PASSWORD = ""
+# 訂閱範例指令: mosquitto_sub -h localhost -t pi5/vision/yolo
+
+mqtt_client = mqtt.Client()
+
+if MQTT_USERNAME:
+    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt_client.loop_start()
+## MQTT 範例
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -17,7 +35,7 @@ logging.basicConfig(level=logging.DEBUG)
 try:
     model_path = "y11n_batch4_e50_size320_renew.pt"
     model = YOLO(model_path)
-    logging.info(f"YOLOv8 model loaded from {model_path}")
+    logging.info(f"YOLOv11 model loaded from {model_path}")
 except Exception as e:
     logging.error(f"Failed to load YOLO model: {e}")
     model = None
@@ -52,10 +70,8 @@ area_lock = threading.Lock()
 # ====================================================================
 
 def capture_frames_yolo(camera_index=0):
-    """獨立執行緒：持續從 Camera 0 讀取影像給 YOLO 用。"""
-    global yolo_latest_frame
-    global yolo_camera
-    global is_running
+    # """獨立執行緒：持續從 Camera 0 讀取影像給 YOLO 用，並發布 MQTT"""
+    global yolo_latest_frame, yolo_camera, is_running
 
     yolo_camera = cv2.VideoCapture(camera_index)
     if not yolo_camera.isOpened():
@@ -63,15 +79,43 @@ def capture_frames_yolo(camera_index=0):
         return
 
     logging.info(f"Camera {camera_index} (YOLO) capture thread started.")
+
     while is_running:
         success, frame = yolo_camera.read()
         if not success:
-            logging.warning(f"Error reading frame from Camera {camera_index} (YOLO).")
-            break
-        
+            continue
+
         yolo_latest_frame = frame.copy()
         yolo_frame_event.set()
         yolo_frame_event.clear()
+
+        # --- YOLO 偵測 ---
+        if model is not None:
+            results = model(frame, conf=0.7, verbose=False)[0]
+
+            from collections import defaultdict
+            yolo_aggregate = defaultdict(list)
+
+            for box in results.boxes:
+                cls = int(box.cls[0])
+                label = results.names[cls]
+                conf = float(box.conf[0])
+                yolo_aggregate[label].append(conf)
+
+            # 計算平均信心度
+            yolo_data = []
+            for label, conf_list in yolo_aggregate.items():
+                avg_conf = sum(conf_list) / len(conf_list)
+                # 範例：只發送 avg_conf >= 0.6 的類別，可依需求調整
+                if avg_conf >= 0.6:
+                    yolo_data.append({
+                        "label": label,
+                        "confidence": round(avg_conf, 3)
+                    })
+
+            if yolo_data:
+                mqtt_client.publish("pi5/vision/yolo", json.dumps(yolo_data))
+
         time.sleep(0.1)
 
     if yolo_camera:
@@ -80,27 +124,51 @@ def capture_frames_yolo(camera_index=0):
 
 
 def capture_frames_area(camera_index=1):
-    """獨立執行緒：持續從 Camera 1 讀取影像給 HSV/面積用。"""
-    global area_latest_frame
-    global area_camera
-    global is_running
+    # """獨立執行緒：持續從 Camera 1 讀取影像給 HSV/面積用，並發布 MQTT"""
+    global area_latest_frame, area_camera, is_running
 
-    # 使用不同的 Camera Index
     area_camera = cv2.VideoCapture(camera_index)
     if not area_camera.isOpened():
         logging.error(f"無法開啟 Camera {camera_index} (AREA)。")
         return
 
     logging.info(f"Camera {camera_index} (AREA) capture thread started.")
+
     while is_running:
         success, frame = area_camera.read()
         if not success:
-            logging.warning(f"Error reading frame from Camera {camera_index} (AREA).")
-            break
-        
+            continue
+
         area_latest_frame = frame.copy()
         area_frame_event.set()
         area_frame_event.clear()
+
+        # --- HSV 偵測 ---
+        with hsv_lock:
+            LOWER_HSV = np.array([hsv_params['H_min'], hsv_params['S_min'], hsv_params['V_min']])
+            UPPER_HSV = np.array([hsv_params['H_max'], hsv_params['S_max'], hsv_params['V_max']])
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, LOWER_HSV, UPPER_HSV)
+        kernel = np.ones((7, 7), np.uint8)
+        processed_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        processed_mask = cv2.morphologyEx(processed_mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(processed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        area = 0
+        percentage = 0
+
+        min_area_threshold = 500
+        valid_contours = [c for c in contours if cv2.contourArea(c) > min_area_threshold]
+        if valid_contours:
+            largest_contour = max(valid_contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+            percentage = calculate_inflation_percentage(area)
+
+        # --- 發布 MQTT ---
+        area_data = {"inflation_percentage": round(percentage, 2)}
+        mqtt_client.publish("pi5/vision/area", json.dumps(area_data))
+
         time.sleep(0.1)
 
     if area_camera:
@@ -112,9 +180,9 @@ def capture_frames_area(camera_index=1):
 # ====================================================================
 
 def calculate_inflation_percentage(current_area):
-    """
-    根據當前面積，與參考面積和最大面積計算膨脹百分比。
-    """
+    # """
+    # 根據當前面積，與參考面積和最大面積計算膨脹百分比。
+    # """
     with area_lock:
         ref_area = area_params['Ref_Area']
         max_area = area_params['Max_Area']
@@ -130,43 +198,23 @@ def calculate_inflation_percentage(current_area):
 # 影像串流產生器 (YOLO 偵測) - 使用 Camera 0 數據
 # ====================================================================
 
-@app.route('/video')
+@app.route('/yolo')
 def video_feed_yolo():
     logging.debug("YOLO video feed route accessed")
 
     def generate_frames_yolo():
-        if model is None:
-            # 模型載入失敗錯誤處理 (與上次相同)
-            error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(error_frame, "YOLO Model Error!", (50, 240), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            _, img_encoded = cv2.imencode('.jpg', error_frame)
-            img_bytes = img_encoded.tobytes()
-            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n')
-            return
-
         while True:
-            # 🔔 等待 YOLO 攝影機 (Camera 0) 的新畫面
             yolo_frame_event.wait()
-            
             if yolo_latest_frame is None:
                 continue
-
             frame = yolo_latest_frame.copy()
-            
-            # 模型推論
-            results = model(frame, conf=0.7, verbose=False)[0] 
-            annotated_frame = results.plot()
-
-            # 編碼並輸出
-            encode_param = [cv2.IMWRITE_JPEG_QUALITY, 90]
-            _, img_encoded = cv2.imencode('.jpg', annotated_frame, encode_param)
-            img_bytes = img_encoded.tobytes()
-
-            yield (b'--frame\r\n'
-                    b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n')
+            results = model(frame, conf=0.7, verbose=False)[0]
+            annotated_frame = results.plot()  # 或 results.plot() 如果你希望加上 YOLO 標註
+            _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
     return Response(generate_frames_yolo(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 
 # ====================================================================
@@ -176,57 +224,17 @@ def video_feed_yolo():
 @app.route('/area')
 def video_feed_area():
     logging.debug("Area video feed route accessed")
+
+    def generate_frames_area():
+        while True:
+            area_frame_event.wait()
+            if area_latest_frame is None:
+                continue
+            frame = area_latest_frame.copy()
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
     return Response(generate_frames_area(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-def generate_frames_area():
-    while True:
-        # 🔔 等待 Area 攝影機 (Camera 1) 的新畫面
-        area_frame_event.wait()
-        
-        if area_latest_frame is None:
-            continue
-        
-        frame = area_latest_frame.copy()
-        
-        # --- 讀取最新的 HSV 參數 (與上次相同) ---
-        with hsv_lock:
-            LOWER_HSV = np.array([hsv_params['H_min'], hsv_params['S_min'], hsv_params['V_min']])
-            UPPER_HSV = np.array([hsv_params['H_max'], hsv_params['S_max'], hsv_params['V_max']])
-        
-        # --- 影像處理與顯示 (與上次相同) ---
-        
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, LOWER_HSV, UPPER_HSV)
-        
-        kernel_morph = np.ones((7, 7), np.uint8) 
-        processed_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_morph)
-        processed_mask = cv2.morphologyEx(processed_mask, cv2.MORPH_OPEN, kernel_morph)
-        
-        contours, _ = cv2.findContours(processed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        area = 0
-        percentage = 0
-        
-        min_area_threshold = 500
-        valid_contours = [c for c in contours if cv2.contourArea(c) > min_area_threshold]
-
-        if valid_contours:
-            largest_contour = max(valid_contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            percentage = calculate_inflation_percentage(area)
-            cv2.drawContours(frame, [largest_contour], -1, (0, 255, 0), 2)
-        
-        cv2.putText(frame, f"Area: {area:.2f} px", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-        cv2.putText(frame, f"Inflation: {percentage:.2f}%", (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # 傳輸 MJPEG 串流
-        encode_param = [cv2.IMWRITE_JPEG_QUALITY, 90]
-        _, buffer = cv2.imencode('.jpg', frame, encode_param)
-        frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 # ====================================================================
 # API 路由與 HTML 介面 (保持不變)
@@ -235,7 +243,7 @@ def generate_frames_area():
 # ... (hsv_update, area_update, index 函數與上一個答案中的整合版本相同) ...
 @app.route('/hsv_update', methods=['POST'])
 def hsv_update():
-    """接收來自前端的 HSV 參數並更新全域變數。"""
+    # """接收來自前端的 HSV 參數並更新全域變數。"""
     global hsv_params
     data = request.get_json()
     
@@ -257,7 +265,7 @@ def hsv_update():
 
 @app.route('/area_update', methods=['POST'])
 def area_update():
-    """接收來自前端的面積參數 (Ref_Area 和 Max_Area) 並更新全域變數。"""
+    # """接收來自前端的面積參數 (Ref_Area 和 Max_Area) 並更新全域變數。"""
     global area_params
     data = request.get_json()
     
@@ -280,7 +288,7 @@ def area_update():
 
 @app.route('/')
 def index():
-    """HTML 介面 (同時顯示兩個影像串流和參數控制)"""
+    # """HTML 介面 (同時顯示兩個影像串流和參數控制)"""
     global hsv_params
     global area_params
     
@@ -402,7 +410,7 @@ def index():
                 
                 <div class="video-stream-container">
                     <div class="video-title"> Camera 0：YOLO 辛香料偵測</div>
-                    <img class="video-stream" src="/video" alt="YOLO 影像串流" width="640" height="480">
+                    <img class="video-stream" src="/yolo" alt="YOLO 影像串流" width="640" height="480">
                 </div>
                 
                 <div class="video-stream-container">
@@ -590,7 +598,7 @@ def index():
 if __name__ == '__main__':
     # 啟動兩個獨立的執行緒來處理兩個攝影機擷取
     yolo_thread = threading.Thread(target=capture_frames_yolo, args=(0,))
-    area_thread = threading.Thread(target=capture_frames_area, args=(2,)) # 🚨 注意這裡使用 Camera 1
+    area_thread = threading.Thread(target=capture_frames_area, args=(2,)) # 注意這裡使用 Camera 1
     
     yolo_thread.daemon = True 
     area_thread.daemon = True 
