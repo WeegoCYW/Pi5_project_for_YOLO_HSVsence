@@ -107,16 +107,23 @@ def capture_frames_yolo(camera_index=0):
             for label, conf_list in yolo_aggregate.items():
                 avg_conf = sum(conf_list) / len(conf_list)
                 # 範例：只發送 avg_conf >= 0.6 的類別，可依需求調整
-                if avg_conf >= 0.6:
+                if avg_conf >= 0.5:
                     yolo_data.append({
                         "label": label,
                         "confidence": round(avg_conf, 3)
                     })
 
             if yolo_data:
-                mqtt_client.publish("pi5/vision/yolo", json.dumps(yolo_data))
 
-        time.sleep(0.1)
+                # 取得陣列中的第一個元素 (物件)
+                single_object = yolo_data[0]   
+                # 將單一物件轉換為 JSON 字串
+                json_output = json.dumps(single_object)
+                # 發布 MQTT 訊息
+                mqtt_client.publish("pi5/vision/yolo", json_output)
+                print(json_output) 
+
+        time.sleep(0.01)
 
     if yolo_camera:
         yolo_camera.release()
@@ -139,10 +146,6 @@ def capture_frames_area(camera_index=1):
         if not success:
             continue
 
-        area_latest_frame = frame.copy()
-        area_frame_event.set()
-        area_frame_event.clear()
-
         # --- HSV 偵測 ---
         with hsv_lock:
             LOWER_HSV = np.array([hsv_params['H_min'], hsv_params['S_min'], hsv_params['V_min']])
@@ -164,10 +167,22 @@ def capture_frames_area(camera_index=1):
             largest_contour = max(valid_contours, key=cv2.contourArea)
             area = cv2.contourArea(largest_contour)
             percentage = calculate_inflation_percentage(area)
+            # 繪製輪廓
+            cv2.drawContours(frame, [largest_contour], -1, (0, 255, 0), 2)
+        # 繪製文字，顯示面積和百分比
+        cv2.putText(frame, f"Area: {area:.2f} px", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        cv2.putText(frame, f"Inflation: {percentage:.2f}%", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)    
 
         # --- 發布 MQTT ---
         area_data = {"inflation_percentage": round(percentage, 2)}
         mqtt_client.publish("pi5/vision/area", json.dumps(area_data))
+        print(json.dumps(area_data))
+
+        area_latest_frame = frame.copy()
+        area_frame_event.set()
+        area_frame_event.clear()
 
         time.sleep(0.1)
 
@@ -209,7 +224,7 @@ def video_feed_yolo():
                 continue
             frame = yolo_latest_frame.copy()
             results = model(frame, conf=0.7, verbose=False)[0]
-            annotated_frame = results.plot()  # 或 results.plot() 如果你希望加上 YOLO 標註
+            annotated_frame = results.plot(conf=False)  # 或 results.plot() 如果你希望加上 YOLO 標註
             _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
@@ -597,8 +612,8 @@ def index():
 
 if __name__ == '__main__':
     # 啟動兩個獨立的執行緒來處理兩個攝影機擷取
-    yolo_thread = threading.Thread(target=capture_frames_yolo, args=(0,))
-    area_thread = threading.Thread(target=capture_frames_area, args=(2,)) # 注意這裡使用 Camera 1
+    yolo_thread = threading.Thread(target=capture_frames_yolo, args=(2,))
+    area_thread = threading.Thread(target=capture_frames_area, args=(0,)) # 注意這裡使用 Camera 1
     
     yolo_thread.daemon = True 
     area_thread.daemon = True 
